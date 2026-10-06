@@ -31,9 +31,29 @@ func decodeOne(data []byte, pos int, c *Counter) (*Packet, int, error) {
 	b0 := data[pos]
 	ptype := b0 >> 4
 	flags := b0 & 0x0f
-	length := int(data[pos+1])
-	start := pos + 2
-	body := data[start:]
+	length := 0
+	mult := 1
+	i := pos + 1
+	for {
+		if i >= len(data) {
+			return nil, pos, errors.New("short")
+		}
+		d := data[i]
+		length += int(d&0x7f) * mult
+		i++
+		if d&0x80 == 0 {
+			break
+		}
+		mult *= 128
+		if mult > 128*128*128 {
+			return nil, pos, errors.New("malformed")
+		}
+	}
+	start := i
+	if start+length > len(data) {
+		return nil, pos, errors.New("short")
+	}
+	body := data[start : start+length]
 	p := &Packet{Type: ptype, Flags: flags}
 	if ptype == 3 {
 		if len(body) < 2 {
@@ -42,9 +62,18 @@ func decodeOne(data []byte, pos int, c *Counter) (*Packet, int, error) {
 		p.QoS = (flags >> 1) & 0x3
 		tl := int(binary.BigEndian.Uint16(body))
 		if 2+tl > len(body) {
-			tl = len(body) - 2
+			return nil, pos, errors.New("short")
 		}
 		p.Topic = string(body[2 : 2+tl])
+		rest := body[2+tl:]
+		if p.QoS > 0 {
+			if len(rest) < 2 {
+				return nil, pos, errors.New("short")
+			}
+			p.PacketID = int(binary.BigEndian.Uint16(rest))
+			rest = rest[2:]
+		}
+		p.Payload = rest
 	}
 	return p, start + length, nil
 }
@@ -98,47 +127,96 @@ type Delivery struct {
 	QoS    byte
 }
 
+// trieNode 是按主题段建立的订阅索引。
+type trieNode struct {
+	children map[string]*trieNode
+	plus     *trieNode
+	hash     []Sub
+	subs     []Sub
+}
+
+func (n *trieNode) insert(segments []string, s Sub) {
+	if len(segments) == 0 {
+		n.subs = append(n.subs, s)
+		return
+	}
+	seg := segments[0]
+	if seg == "#" {
+		n.hash = append(n.hash, s)
+		return
+	}
+	if seg == "+" {
+		if n.plus == nil {
+			n.plus = &trieNode{}
+		}
+		n.plus.insert(segments[1:], s)
+		return
+	}
+	if n.children == nil {
+		n.children = map[string]*trieNode{}
+	}
+	child := n.children[seg]
+	if child == nil {
+		child = &trieNode{}
+		n.children[seg] = child
+	}
+	child.insert(segments[1:], s)
+}
+
+func (n *trieNode) match(segments []string, i int, c *Counter, hit func(Sub)) {
+	c.Scanned++
+	for _, s := range n.hash {
+		hit(s)
+	}
+	if i == len(segments) {
+		for _, s := range n.subs {
+			hit(s)
+		}
+		return
+	}
+	if child := n.children[segments[i]]; child != nil {
+		child.match(segments, i+1, c, hit)
+	}
+	if n.plus != nil {
+		n.plus.match(segments, i+1, c, hit)
+	}
+}
+
 // Broker 保存订阅并按主题分发。
 type Broker struct {
 	subs     []Sub
+	root     *trieNode
 	inflight map[string]bool
 }
 
 // NewBroker 建一个分发器。
 func NewBroker() *Broker {
-	return &Broker{inflight: map[string]bool{}}
+	return &Broker{root: &trieNode{}, inflight: map[string]bool{}}
 }
 
 // Subscribe 记一条订阅。
 func (b *Broker) Subscribe(client, filter string, qos byte) {
-	b.subs = append(b.subs, Sub{Client: client, Filter: filter, QoS: qos})
-}
-
-func matchFilter(filter, topic string) bool {
-	a := strings.Split(filter, "/")
-	z := strings.Split(topic, "/")
-	if len(a) != len(z) {
-		return false
-	}
-	for i := range a {
-		if a[i] != z[i] {
-			return false
-		}
-	}
-	return true
+	s := Sub{Client: client, Filter: filter, QoS: qos}
+	b.subs = append(b.subs, s)
+	b.root.insert(strings.Split(filter, "/"), s)
 }
 
 // Publish 把一条报文分发给匹配的订阅。
 func (b *Broker) Publish(client string, p *Packet, c *Counter) []Delivery {
-	var out []Delivery
 	if p.QoS > 0 {
-		b.inflight[client+"#"+strconv.Itoa(p.PacketID)] = true
-	}
-	for _, s := range b.subs {
-		c.Scanned++
-		if matchFilter(s.Filter, p.Topic) {
-			out = append(out, Delivery{Client: s.Client, Topic: p.Topic, QoS: p.QoS})
+		key := client + "#" + strconv.Itoa(p.PacketID)
+		if b.inflight[key] {
+			return nil
 		}
+		b.inflight[key] = true
 	}
+	var out []Delivery
+	b.root.match(strings.Split(p.Topic, "/"), 0, c, func(s Sub) {
+		qos := p.QoS
+		if s.QoS < qos {
+			qos = s.QoS
+		}
+		out = append(out, Delivery{Client: s.Client, Topic: p.Topic, QoS: qos})
+	})
 	return out
 }
